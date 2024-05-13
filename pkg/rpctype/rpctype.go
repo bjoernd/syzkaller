@@ -9,6 +9,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/host"
 	"github.com/google/syzkaller/pkg/ipc"
 	"github.com/google/syzkaller/pkg/signal"
@@ -17,12 +18,23 @@ import (
 // ExecutionRequest describes the task of executing a particular program.
 // Corresponds to Fuzzer.Request.
 type ExecutionRequest struct {
-	ID               int64
-	ProgData         []byte
-	ExecOpts         ipc.ExecOpts
-	NewSignal        bool
+	ID        int64
+	ProgData  []byte
+	ExecOpts  ipc.ExecOpts
+	NewSignal bool
+	// If set, ProgData contains compiled executable binary
+	// that needs to be written to disk and executed.
+	IsBinary bool
+	// If set, fully reset executor state befor executing the test.
+	ResetState bool
+	// If set, collect program output and return in ExecutionResult.Output.
+	ReturnOutput bool
+	// If set, don't fail on program failures, instead return the error in ExecutionResult.Error.
+	ReturnError      bool
 	SignalFilter     signal.Signal
 	SignalFilterCall int
+	// Repeat the program that many times (0 means 1).
+	Repeat int
 }
 
 // ExecutionResult is sent after ExecutionRequest is completed.
@@ -31,6 +43,8 @@ type ExecutionResult struct {
 	ProcID int
 	Try    int
 	Info   ipc.ProgInfo
+	Output []byte
+	Error  string
 }
 
 // ExchangeInfoRequest is periodically sent by syz-fuzzer to syz-manager.
@@ -90,7 +104,7 @@ type CheckArgs struct {
 	Error    string
 	Features *host.Features
 	Globs    map[string][]string
-	Files    []host.FileInfo
+	Files    []flatrpc.FileInfo
 }
 
 type CheckRes struct {
@@ -197,25 +211,4 @@ type HubInput struct {
 	// Domain of the source manager.
 	Domain string
 	Prog   []byte
-}
-
-type RunTestPollReq struct {
-	Name string
-}
-
-type RunTestPollRes struct {
-	ID     int
-	Bin    []byte
-	Prog   []byte
-	Cfg    *ipc.Config
-	Opts   *ipc.ExecOpts
-	Repeat int
-}
-
-type RunTestDoneArgs struct {
-	Name   string
-	ID     int
-	Output []byte
-	Info   []*ipc.ProgInfo
-	Error  string
 }

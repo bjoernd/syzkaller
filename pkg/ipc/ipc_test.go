@@ -4,10 +4,9 @@
 package ipc_test
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
-	"os"
-	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
@@ -22,15 +21,6 @@ import (
 	_ "github.com/google/syzkaller/sys"
 	"github.com/google/syzkaller/sys/targets"
 )
-
-func buildExecutor(t *testing.T, target *prog.Target) string {
-	src := filepath.FromSlash("../../executor/executor.cc")
-	bin, err := csource.BuildFile(target, src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return bin
-}
 
 func initTest(t *testing.T) (*prog.Target, rand.Source, int, bool, bool, targets.Timeouts) {
 	t.Parallel()
@@ -65,8 +55,7 @@ func TestExecutor(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			bin := buildExecutor(t, target)
-			defer os.Remove(bin)
+			bin := csource.BuildExecutor(t, target, "../..")
 			// qemu-user may allow us to run some cross-arch binaries.
 			if _, err := osutil.RunCmd(time.Minute, "", bin, "test"); err != nil {
 				if sysTarget.Arch == runtime.GOARCH || sysTarget.VMArch == runtime.GOARCH {
@@ -89,8 +78,7 @@ func prepareTestProgram(target *prog.Target) *prog.Prog {
 func TestExecute(t *testing.T) {
 	target, _, _, useShmem, useForkServer, timeouts := initTest(t)
 
-	bin := buildExecutor(t, target)
-	defer os.Remove(bin)
+	bin := csource.BuildExecutor(t, target, "../..")
 
 	flags := []ExecFlags{0, FlagThreaded}
 	for _, flag := range flags {
@@ -134,8 +122,7 @@ func TestExecute(t *testing.T) {
 
 func TestParallel(t *testing.T) {
 	target, _, _, useShmem, useForkServer, timeouts := initTest(t)
-	bin := buildExecutor(t, target)
-	defer os.Remove(bin)
+	bin := csource.BuildExecutor(t, target, "../..")
 	cfg := &Config{
 		Executor:      bin,
 		UseShmem:      useShmem,
@@ -203,8 +190,7 @@ func TestZlib(t *testing.T) {
 		t.Fatal(err)
 	}
 	opts.EnvFlags |= FlagDebug
-	cfg.Executor = buildExecutor(t, target)
-	defer os.Remove(cfg.Executor)
+	cfg.Executor = csource.BuildExecutor(t, target, "../..")
 	env, err := MakeEnv(cfg, 0)
 	if err != nil {
 		t.Fatalf("failed to create env: %v", err)
@@ -227,5 +213,51 @@ func TestZlib(t *testing.T) {
 		if info.Calls[0].Errno != 0 {
 			t.Fatalf("data comparison failed: %v\n%s", info.Calls[0].Errno, output)
 		}
+	}
+}
+
+func TestExecutorCommonExt(t *testing.T) {
+	target, err := prog.GetTarget("test", "64_fork")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sysTarget := targets.Get(target.OS, target.Arch)
+	if sysTarget.BrokenCompiler != "" {
+		t.Skipf("skipping, broken cross-compiler: %v", sysTarget.BrokenCompiler)
+	}
+	bin := csource.BuildExecutor(t, target, "../..", "-DSYZ_TEST_COMMON_EXT_EXAMPLE=1")
+	out, err := osutil.RunCmd(time.Minute, "", bin, "setup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out, []byte("example setup_ext called")) {
+		t.Fatalf("setup_ext wasn't called:\n%s", out)
+	}
+
+	// The example setup_ext_test does:
+	// *(uint64*)(SYZ_DATA_OFFSET + 0x1234) = 0xbadc0ffee;
+	// The following program tests that that value is present at 0x1234.
+	test := `syz_compare(&(0x7f0000001234)="", 0x8, &(0x7f0000000000)=@blob="eeffc0ad0b000000", AUTO)`
+	p, err := target.Deserialize([]byte(test), prog.Strict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, opts, err := ipcconfig.Default(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Executor = bin
+	opts.EnvFlags |= FlagDebug
+	env, err := MakeEnv(cfg, 0)
+	if err != nil {
+		t.Fatalf("failed to create env: %v", err)
+	}
+	defer env.Close()
+	_, info, _, err := env.Exec(opts, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call := info.Calls[0]; (call.Flags&CallFinished) == 0 || call.Errno != 0 {
+		t.Fatalf("bad call result: flags=%x errno=%v", call.Flags, call.Errno)
 	}
 }

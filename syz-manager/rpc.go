@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/cover"
+	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer"
 	"github.com/google/syzkaller/pkg/host"
 	"github.com/google/syzkaller/pkg/ipc"
@@ -36,13 +37,14 @@ type RPCServer struct {
 
 	checkDone        atomic.Bool
 	checkFiles       []string
-	checkFilesInfo   []host.FileInfo
+	checkFilesInfo   []flatrpc.FileInfo
 	checkProgs       []rpctype.ExecutionRequest
 	checkResults     []rpctype.ExecutionResult
 	needCheckResults int
 	checkFailures    int
 	checkFeatures    *host.Features
-	modules          []host.KernelModule
+	enabledFeatures  flatrpc.Feature
+	modules          []cover.KernelModule
 	canonicalModules *cover.Canonicalizer
 	execCoverFilter  map[uint32]uint32
 	coverFilter      map[uint32]uint32
@@ -97,7 +99,7 @@ type BugFrames struct {
 // RPCManagerView restricts interface between RPCServer and Manager.
 type RPCManagerView interface {
 	currentBugFrames() BugFrames
-	machineChecked(features *host.Features, enabledSyscalls map[*prog.Syscall]bool)
+	machineChecked(features flatrpc.Feature, enabledSyscalls map[*prog.Syscall]bool)
 	getFuzzer() *fuzzer.Fuzzer
 }
 
@@ -127,7 +129,7 @@ func startRPCServer(mgr *Manager) (*RPCServer, error) {
 			"End-to-end fuzzer RPC Exchange call latency (us)", stats.Distribution{}),
 		statCoverFiltered: stats.Create("filtered coverage", "", stats.NoGraph),
 	}
-	s, err := rpctype.NewRPCServer(mgr.cfg.RPC, "Manager", serv, mgr.netCompression)
+	s, err := rpctype.NewRPCServer(mgr.cfg.RPC, "Manager", serv)
 	if err != nil {
 		return nil, err
 	}
@@ -205,6 +207,7 @@ func (serv *RPCServer) Check(a *rpctype.CheckArgs, r *rpctype.CheckRes) error {
 
 	if serv.checkFeatures == nil {
 		serv.checkFeatures = a.Features
+		serv.enabledFeatures = a.Features.ToFlatRPC()
 		serv.checkFilesInfo = a.Files
 		serv.modules = modules
 		serv.target.UpdateGlobs(a.Globs)
@@ -286,7 +289,7 @@ func (serv *RPCServer) finishCheck() error {
 	if len(enabledCalls) == 0 {
 		log.Fatalf("all system calls are disabled")
 	}
-	serv.mgr.machineChecked(serv.checkFeatures, enabledCalls)
+	serv.mgr.machineChecked(serv.enabledFeatures, enabledCalls)
 	return nil
 }
 
@@ -326,20 +329,22 @@ func (serv *RPCServer) ExchangeInfo(a *rpctype.ExchangeInfoRequest, r *rpctype.E
 
 	if !serv.checkDone.Load() {
 		serv.mu.Lock()
-		serv.checkResults = append(serv.checkResults, a.Results...)
-		if len(serv.checkResults) < serv.needCheckResults {
-			numRequests := min(len(serv.checkProgs), a.NeedProgs)
-			r.Requests = serv.checkProgs[:numRequests]
-			serv.checkProgs = serv.checkProgs[numRequests:]
-		} else {
-			if err := serv.finishCheck(); err != nil {
-				log.Fatalf("check failed: %v", err)
+		if !serv.checkDone.Load() {
+			serv.checkResults = append(serv.checkResults, a.Results...)
+			if len(serv.checkResults) < serv.needCheckResults {
+				numRequests := min(len(serv.checkProgs), a.NeedProgs)
+				r.Requests = serv.checkProgs[:numRequests]
+				serv.checkProgs = serv.checkProgs[numRequests:]
+			} else {
+				if err := serv.finishCheck(); err != nil {
+					log.Fatalf("check failed: %v", err)
+				}
+				serv.checkProgs = nil
+				serv.checkResults = nil
+				serv.checkFiles = nil
+				serv.checkFilesInfo = nil
+				serv.checkDone.Store(true)
 			}
-			serv.checkProgs = nil
-			serv.checkResults = nil
-			serv.checkFiles = nil
-			serv.checkFilesInfo = nil
-			serv.checkDone.Store(true)
 		}
 		serv.mu.Unlock()
 		return nil
@@ -446,9 +451,6 @@ func (serv *RPCServer) stopFuzzing(name string) {
 }
 
 func (serv *RPCServer) shutdownInstance(name string, crashed bool) []byte {
-	if !serv.checkDone.Load() {
-		log.Fatalf("VM is exited while checking is not done")
-	}
 	runnerPtr, _ := serv.runners.LoadAndDelete(name)
 	runner := runnerPtr.(*Runner)
 	runner.mu.Lock()
@@ -466,6 +468,9 @@ func (serv *RPCServer) shutdownInstance(name string, crashed bool) []byte {
 	// fuzzerObj may be null, but in that case oldRequests would be empty as well.
 	serv.mu.Lock()
 	defer serv.mu.Unlock()
+	if !serv.checkDone.Load() {
+		log.Fatalf("VM is exited while checking is not done")
+	}
 	fuzzerObj := serv.mgr.getFuzzer()
 	for _, req := range oldRequests {
 		if crashed && req.try >= 0 {
@@ -568,11 +573,12 @@ func (serv *RPCServer) newRequest(runner *Runner, req *fuzzer.Request) (rpctype.
 		NewSignal:        req.NeedSignal == fuzzer.NewSignal,
 		SignalFilter:     signalFilter,
 		SignalFilterCall: req.SignalFilterCall,
+		ResetState:       serv.cfg.Experimental.ResetAccState,
 	}, true
 }
 
 func (serv *RPCServer) createExecOpts(req *fuzzer.Request) ipc.ExecOpts {
-	env := ipc.FeaturesToFlags(serv.checkFeatures, nil)
+	env := ipc.FeaturesToFlags(serv.enabledFeatures, nil)
 	if *flagDebug {
 		env |= ipc.FlagDebug
 	}

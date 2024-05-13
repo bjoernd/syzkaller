@@ -55,6 +55,8 @@ type executionResult struct {
 	procID int
 	try    int
 	info   *ipc.ProgInfo
+	output []byte
+	err    string
 }
 
 // Gate size controls how deep in the log the last executed by every proc
@@ -70,25 +72,20 @@ func main() {
 	debug.SetGCPercent(50)
 
 	var (
-		flagName           = flag.String("name", "test", "unique name for manager")
-		flagOS             = flag.String("os", runtime.GOOS, "target OS")
-		flagArch           = flag.String("arch", runtime.GOARCH, "target arch")
-		flagManager        = flag.String("manager", "", "manager rpc address")
-		flagProcs          = flag.Int("procs", 1, "number of parallel test processes")
-		flagTest           = flag.Bool("test", false, "enable image testing mode")      // used by syz-ci
-		flagRunTest        = flag.Bool("runtest", false, "enable program testing mode") // used by pkg/runtest
-		flagPprofPort      = flag.Int("pprof_port", 0, "HTTP port for the pprof endpoint (disabled if 0)")
-		flagNetCompression = flag.Bool("net_compression", false, "use network compression for RPC calls")
-
-		// Experimental flags.
-		flagResetAccState = flag.Bool("reset_acc_state", false, "restarts executor before most executions")
+		flagName      = flag.String("name", "test", "unique name for manager")
+		flagOS        = flag.String("os", runtime.GOOS, "target OS")
+		flagArch      = flag.String("arch", runtime.GOARCH, "target arch")
+		flagManager   = flag.String("manager", "", "manager rpc address")
+		flagProcs     = flag.Int("procs", 1, "number of parallel test processes")
+		flagTest      = flag.Bool("test", false, "enable image testing mode") // used by syz-ci
+		flagPprofPort = flag.Int("pprof_port", 0, "HTTP port for the pprof endpoint (disabled if 0)")
 	)
 	defer tool.Init()()
 	log.Logf(0, "fuzzer started")
 
 	target, err := prog.GetTarget(*flagOS, *flagArch)
 	if err != nil {
-		log.SyzFatalf("%v", err)
+		log.SyzFatal(err)
 	}
 
 	config, execOpts, err := ipcconfig.Default(target)
@@ -125,7 +122,7 @@ func main() {
 	}
 
 	log.Logf(0, "dialing manager at %v", *flagManager)
-	manager, err := rpctype.NewRPCClient(*flagManager, timeouts.Scale, false, *flagNetCompression)
+	manager, err := rpctype.NewRPCClient(*flagManager)
 	if err != nil {
 		log.SyzFatalf("failed to create an RPC client: %v ", err)
 	}
@@ -146,7 +143,7 @@ func main() {
 	}
 	featureFlags, err := csource.ParseFeaturesFlags("none", "none", true)
 	if err != nil {
-		log.SyzFatalf("%v", err)
+		log.SyzFatal(err)
 	}
 	var checkReq *rpctype.CheckArgs
 	if r.Features == nil {
@@ -161,7 +158,7 @@ func main() {
 		r.Features = checkReq.Features
 	} else {
 		if err = host.Setup(target, r.Features, featureFlags, executor); err != nil {
-			log.SyzFatalf("%v", err)
+			log.SyzFatal(err)
 		}
 		checkReq = new(rpctype.CheckArgs)
 	}
@@ -185,7 +182,7 @@ func main() {
 
 	log.Logf(0, "starting %v executor processes", *flagProcs)
 	for pid := 0; pid < *flagProcs; pid++ {
-		startProc(fuzzerTool, pid, config, *flagResetAccState)
+		startProc(fuzzerTool, pid, config)
 	}
 
 	checkReq.Name = *flagName
@@ -206,10 +203,6 @@ func main() {
 		log.SyzFatalf("%v", checkReq.Error)
 	}
 
-	if *flagRunTest {
-		runTest(target, manager, *flagName, executor)
-		return
-	}
 	if checkRes.CoverFilterBitmap != nil {
 		if err := osutil.WriteFile("syz-cover-bitmap", checkRes.CoverFilterBitmap); err != nil {
 			log.SyzFatalf("failed to write syz-cover-bitmap: %v", err)
@@ -340,6 +333,8 @@ func (tool *FuzzerTool) convertExecutionResult(res executionResult) rpctype.Exec
 		ID:     res.ID,
 		ProcID: res.procID,
 		Try:    res.try,
+		Output: res.output,
+		Error:  res.err,
 	}
 	if res.info != nil {
 		if res.NewSignal {

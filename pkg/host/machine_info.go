@@ -7,23 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/google/syzkaller/pkg/flatrpc"
 )
 
-type KernelModule struct {
-	Name string `json:"Name"`
-	Addr uint64 `json:"Addr"`
-	Size uint64 `json:"Size"`
-}
-
-type FileInfo struct {
-	Name   string
-	Exists bool
-	Error  string
-	Data   []byte
-}
-
-func ReadFiles(files []string) []FileInfo {
-	var res []FileInfo
+func ReadFiles(files []string) []flatrpc.FileInfo {
+	var res []flatrpc.FileInfo
 	for _, glob := range files {
 		glob = filepath.FromSlash(glob)
 		if !strings.Contains(glob, "*") {
@@ -32,7 +21,7 @@ func ReadFiles(files []string) []FileInfo {
 		}
 		matches, err := filepath.Glob(glob)
 		if err != nil {
-			res = append(res, FileInfo{
+			res = append(res, flatrpc.FileInfo{
 				Name:  glob,
 				Error: err.Error(),
 			})
@@ -45,13 +34,13 @@ func ReadFiles(files []string) []FileInfo {
 	return res
 }
 
-func readFile(file string) FileInfo {
+func readFile(file string) flatrpc.FileInfo {
 	data, err := os.ReadFile(file)
 	exists, errStr := true, ""
 	if err != nil {
 		exists, errStr = !os.IsNotExist(err), err.Error()
 	}
-	return FileInfo{
+	return flatrpc.FileInfo{
 		Name:   file,
 		Exists: exists,
 		Error:  errStr,

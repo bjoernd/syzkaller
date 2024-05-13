@@ -6,6 +6,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"time"
 
@@ -15,7 +16,6 @@ import (
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/rpctype"
-	"github.com/google/syzkaller/pkg/runtest"
 	"github.com/google/syzkaller/prog"
 )
 
@@ -30,79 +30,25 @@ type checkArgs struct {
 }
 
 func testImage(hostAddr string, args *checkArgs) {
-	log.Logf(0, "connecting to host at %v", hostAddr)
-	conn, err := rpctype.Dial(hostAddr, args.ipcConfig.Timeouts.Scale)
-	if err != nil {
-		log.SyzFatalf("BUG: failed to connect to host: %v", err)
+	// gVisor uses "stdin" for communication, which is not a real tcp address.
+	if hostAddr != "stdin" {
+		log.Logf(0, "connecting to host at %v", hostAddr)
+		timeout := time.Minute * args.ipcConfig.Timeouts.Scale
+		conn, err := net.DialTimeout("tcp", hostAddr, timeout)
+		if err != nil {
+			log.SyzFatalf("failed to connect to host: %v", err)
+		}
+		conn.Close()
 	}
-	conn.Close()
 	if err := checkRevisions(args); err != nil {
-		log.SyzFatalf("BUG: %v", err)
+		log.SyzFatal(err)
 	}
 	if _, err := checkMachine(args); err != nil {
-		log.SyzFatalf("BUG: %v", err)
+		log.SyzFatal(err)
 	}
 	if err := buildCallList(args.target, args.sandbox); err != nil {
-		log.SyzFatalf("BUG: %v", err)
+		log.SyzFatal(err)
 	}
-}
-
-func runTest(target *prog.Target, manager *rpctype.RPCClient, name, executor string) {
-	pollReq := &rpctype.RunTestPollReq{Name: name}
-	for {
-		req := new(rpctype.RunTestPollRes)
-		if err := manager.Call("Manager.Poll", pollReq, req); err != nil {
-			log.SyzFatalf("Manager.Poll call failed: %v", err)
-		}
-		if len(req.Bin) == 0 && len(req.Prog) == 0 {
-			return
-		}
-		test := convertTestReq(target, req)
-		if test.Err == nil {
-			runtest.RunTest(test, executor)
-		}
-		reply := &rpctype.RunTestDoneArgs{
-			Name:   name,
-			ID:     req.ID,
-			Output: test.Output,
-			Info:   test.Info,
-		}
-		if test.Err != nil {
-			reply.Error = test.Err.Error()
-		}
-		if err := manager.Call("Manager.Done", reply, nil); err != nil {
-			log.SyzFatalf("Manager.Done call failed: %v", err)
-		}
-	}
-}
-
-func convertTestReq(target *prog.Target, req *rpctype.RunTestPollRes) *runtest.RunRequest {
-	test := &runtest.RunRequest{
-		Cfg:    req.Cfg,
-		Opts:   req.Opts,
-		Repeat: req.Repeat,
-	}
-	if len(req.Bin) != 0 {
-		bin, err := osutil.TempFile("syz-runtest")
-		if err != nil {
-			test.Err = err
-			return test
-		}
-		if err := osutil.WriteExecFile(bin, req.Bin); err != nil {
-			test.Err = err
-			return test
-		}
-		test.Bin = bin
-	}
-	if len(req.Prog) != 0 {
-		p, err := target.Deserialize(req.Prog, prog.NonStrict)
-		if err != nil {
-			test.Err = err
-			return test
-		}
-		test.P = p
-	}
-	return test
 }
 
 func checkMachineHeartbeats(done chan bool) {
@@ -145,7 +91,7 @@ func checkMachine(args *checkArgs) (*rpctype.CheckArgs, error) {
 		args.ipcExecOpts.EnvFlags&ipc.FlagSandboxAndroid != 0 {
 		return nil, fmt.Errorf("sandbox=android is not supported (%v)", feat.Reason)
 	}
-	args.ipcExecOpts.EnvFlags |= ipc.FeaturesToFlags(features, nil)
+	args.ipcExecOpts.EnvFlags |= ipc.FeaturesToFlags(features.ToFlatRPC(), nil)
 	if err := checkSimpleProgram(args, features); err != nil {
 		return nil, err
 	}
